@@ -241,7 +241,7 @@ def main():
         
         with col2:
             st.write("**Contoh Foto yang Baik:**")
-            st.image("https://github.com/wilsonhutapea/hepacheck-ai/blob/main/assets/images/fadey%20contoh.jpg?raw=true", 
+            st.image("https://github.com/wilsonhutapea/hepacheck-ai/blob/main/assets/images/fadey%20contoh_compressed.jpg?raw=true", 
                     caption="Foto dengan pencahayaan baik", width=300)
     
     # ========================================================================
