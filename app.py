@@ -1,15 +1,38 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
-from utils.eye_detection import multi_stage_detection
-from utils.jaundice_analysis import (
-    analyze_sclera_color,
-    detect_jaundice,
-    get_risk_level,
-    create_visualization_data
-)
-# hello
+from PIL import Image, ImageOps
+import pickle
+from pathlib import Path
+from utils.eye_detection_module_v3 import multi_stage_detection
+
+# ============================================================================
+# LOAD KNN MODEL
+# ============================================================================
+@st.cache_resource
+def load_knn_model():
+    """Load KNN jaundice detection model"""
+    model_path = Path(__file__).parent / "knn_jaundice_model_v5.pkl"
+    try:
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+        return model
+    except Exception as e:
+        st.error(f"Error loading KNN model: {e}")
+        return None
+
+@st.cache_resource
+def load_knn_urine_model():
+    """Load KNN urine jaundice detection model"""
+    model_path = Path(__file__).parent / "knn_urine_jaundice_model.pkl"
+    try:
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+        return model
+    except Exception as e:
+        st.error(f"Error loading KNN Urine model: {e}")
+        return None
+
 # ============================================================================
 # KONFIGURASI HALAMAN
 # ============================================================================
@@ -61,18 +84,63 @@ st.markdown("""
 # PERTANYAAN UNTUK USER
 # ============================================================================
 QUESTIONS = [
-    "Demam sebelum gejala hati muncul?",
-    "Nyeri otot (myalgia)?",
-    "Mual atau muntah?",
-    "Nyeri perut kanan atas?",
-    "Feses pucat/abu-abu?",
-    "Lama gejala berlangsung?",
-    "Fatigue / lemas kronis?",
-    "Gatal pada kulit?",
-    "Perut membesar (ascites)?",
-    "Mudah memar/pendarahan?",
-    "Kaki bengkak?"
+    {
+        "question": "Demam sebelum gejala hati muncul?",
+        "options": ["Ya", "Tidak"],
+        "scores": [2, 0]
+    },
+    {
+        "question": "Nyeri otot (myalgia)?",
+        "options": ["Sering/Sangat sering", "Jarang/Kadang", "Tidak pernah"],
+        "scores": [2, 1, 0]
+    },
+    {
+        "question": "Mual atau muntah?",
+        "options": ["Sering/Sangat sering", "Jarang/Kadang", "Tidak pernah"],
+        "scores": [2, 1, 0]
+    },
+    {
+        "question": "Nyeri perut kanan atas?",
+        "options": ["Nyeri berat/sangat parah", "Nyeri sedang", "Tidak/nyeri ringan"],
+        "scores": [2, 1, 0]
+    },
+    {
+        "question": "Feses pucat/abu-abu?",
+        "options": ["Ya", "Tidak"],
+        "scores": [2, 0]
+    },
+    {
+        "question": "Lama gejala berlangsung:",
+        "options": ["< 6 minggu", "6 minggu – 6 bulan", "> 6 bulan"],
+        "scores": [0, 1, 3]
+    },
+    {
+        "question": "Fatigue / lemas kronis?",
+        "options": ["Sering/Sangat sering", "Jarang/Kadang", "Tidak"],
+        "scores": [2, 1, 0]
+    },
+    {
+        "question": "Gatal pada kulit?",
+        "options": ["Sering/Sangat sering", "Jarang/Kadang", "Tidak"],
+        "scores": [2, 1, 0]
+    },
+    {
+        "question": "Perut membesar (ascites)?",
+        "options": ["Ya", "Tidak"],
+        "scores": [3, 0]
+    },
+    {
+        "question": "Mudah memar/pendarahan?",
+        "options": ["Ya", "Tidak"],
+        "scores": [3, 0]
+    },
+    {
+        "question": "Kaki bengkak (edema)?",
+        "options": ["Ya", "Tidak"],
+        "scores": [2, 0]
+    }
 ]
+MAX_SYMPTOM_SCORE = 25 # Sum of max scores: 2+2+2+2+2+3+2+2+3+3+2 = 25
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -80,6 +148,7 @@ QUESTIONS = [
 def convert_uploaded_image(uploaded_file):
     """Convert uploaded file to OpenCV format"""
     image = Image.open(uploaded_file)
+    image = ImageOps.exif_transpose(image)
     image_array = np.array(image)
     
     # Handle different image formats
@@ -90,48 +159,206 @@ def convert_uploaded_image(uploaded_file):
     else:  # RGB
         image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
     
-    return image_array
+    return image_array, image
 
-def analyze_urine_color(image):
-    """Analyze urine color for jaundice indicators"""
-    # Convert to HSV for better color analysis
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+def extract_sclera_rgb_from_detection(eye_image, eye_mask):
+    """
+    Extract median RGB values from detected sclera region
     
-    # Get average color from center region (avoid edges)
-    h, w = image.shape[:2]
-    center_region = hsv[h//4:3*h//4, w//4:3*w//4]
+    Args:
+        eye_image: numpy array (BGR format) - detected eye region
+        eye_mask: binary mask of sclera region
     
-    avg_hsv = center_region.mean(axis=(0, 1))
-    h_avg, s_avg, v_avg = avg_hsv
+    Returns:
+        tuple: (R, G, B) median values or None if extraction fails
+    """
+    if eye_image is None or eye_mask is None:
+        return None
     
-    # Get RGB average
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    center_rgb = rgb[h//4:3*h//4, w//4:3*w//4]
-    avg_rgb = center_rgb.mean(axis=(0, 1))
+    if np.sum(eye_mask) == 0:
+        return None
     
-    # Detect dark urine (indicator of jaundice)
-    # Dark urine: low brightness, yellow-orange hue
-    is_dark = v_avg < 150
-    is_yellow_orange = (15 < h_avg < 45)
-    high_saturation = s_avg > 80
+    # Convert BGR to RGB
+    eye_rgb = cv2.cvtColor(eye_image, cv2.COLOR_BGR2RGB)
     
-    confidence = 0
-    if is_dark:
-        confidence += 40
-    if is_yellow_orange:
-        confidence += 35
-    if high_saturation:
-        confidence += 25
+    # Extract sclera pixels
+    sclera_pixels = eye_rgb[eye_mask > 0]
     
-    is_abnormal = confidence > 50
+    if len(sclera_pixels) == 0:
+        return None
     
-    return {
-        'rgb': avg_rgb,
-        'hsv': avg_hsv,
-        'is_abnormal': is_abnormal,
-        'confidence': confidence,
-        'brightness': v_avg
-    }
+    # Calculate median RGB
+    median_rgb = np.median(sclera_pixels, axis=0)
+    r, g, b = median_rgb
+    
+    return (int(r), int(g), int(b))
+
+def classify_jaundice_knn(rgb_values, knn_model):
+    """
+    Classify jaundice using KNN model
+    
+    Args:
+        rgb_values: tuple (R, G, B)
+        knn_model: loaded KNN model
+    
+    Returns:
+        dict with prediction results or None
+    """
+    if rgb_values is None or knn_model is None:
+        return None
+    
+    try:
+        # Prepare input for model
+        input_data = np.array([list(rgb_values)])
+        
+        # Get prediction
+        prediction = knn_model.predict(input_data)[0]
+        
+        # Get prediction probabilities
+        probabilities = knn_model.predict_proba(input_data)[0]
+        
+        # Class 0 = Normal, Class 2 = Jaundice
+        # The model was trained with classes 0 and 2
+        classes = knn_model.classes_
+        
+        # Find confidence for the predicted class
+        pred_idx = np.where(classes == prediction)[0][0]
+        confidence = probabilities[pred_idx] * 100
+        
+        # Determine status
+        is_jaundice = (prediction == 2)
+        status = "Jaundice Terdeteksi" if is_jaundice else "Normal"
+        
+        return {
+            'prediction': int(prediction),
+            'is_jaundice': is_jaundice,
+            'status': status,
+            'confidence': confidence,
+            'probabilities': probabilities,
+            'classes': classes
+        }
+    
+    except Exception as e:
+        st.error(f"Error during classification: {e}")
+        return None
+
+def extract_urine_rgb(image):
+    """
+    Extract median RGB values from urine region in the image using HSV masking.
+    This method is aligned with the dataset creation script.
+    
+    Args:
+        image: numpy array (BGR format)
+    
+    Returns:
+        tuple: ((R, G, B), mask) or (None, None) if processing fails
+    """
+    try:
+        if image is None:
+            return None, None
+        
+        # Convert to RGB (for final output) and HSV (for masking)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        
+        h_img, w_img = image.shape[:2]
+        
+        # Strategy 1: Detect urine region using color and brightness masks
+        hue_mask = cv2.inRange(h, 0, 45)
+        saturation_mask = cv2.inRange(s, 40, 255)
+        brightness_mask = cv2.inRange(v, 40, 245)
+        
+        temp_mask = cv2.bitwise_and(hue_mask, saturation_mask)
+        urine_mask = cv2.bitwise_and(temp_mask, brightness_mask)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        urine_mask = cv2.morphologyEx(urine_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+        urine_mask = cv2.morphologyEx(urine_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        
+        urine_pixels = image_rgb[urine_mask > 0]
+        final_mask = urine_mask
+        
+        # Strategy 2: Fallback to central region if mask is insufficient
+        if len(urine_pixels) < 500:
+            y_start = int(h_img * 0.2)
+            y_end = int(h_img * 0.8)
+            x_start = int(w_img * 0.2)
+            x_end = int(w_img * 0.8)
+            
+            center_region_rgb = image_rgb[y_start:y_end, x_start:x_end]
+            
+            center_hsv = cv2.cvtColor(center_region_rgb, cv2.COLOR_RGB2HSV)
+            center_h, center_s, center_v = cv2.split(center_hsv)
+            
+            center_hue_mask = cv2.inRange(center_h, 0, 45)
+            center_saturation_mask = cv2.inRange(center_s, 40, 255)
+            center_brightness_mask = cv2.inRange(center_v, 40, 245)
+            
+            temp_mask = cv2.bitwise_and(center_hue_mask, center_saturation_mask)
+            center_mask = cv2.bitwise_and(temp_mask, center_brightness_mask)
+            
+            urine_pixels = center_region_rgb.reshape(-1, 3)[center_mask.reshape(-1) > 0]
+            
+            final_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+            final_mask[y_start:y_end, x_start:x_end] = center_mask
+
+            if len(urine_pixels) < 100:
+                urine_pixels = center_region_rgb.reshape(-1, 3)
+                final_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+                final_mask[y_start:y_end, x_start:x_end] = 255
+        
+        if len(urine_pixels) == 0:
+            return None, None
+        
+        median_rgb = np.median(urine_pixels, axis=0)
+        red, green, blue = median_rgb
+        
+        return (int(red), int(green), int(blue)), final_mask
+    
+    except Exception as e:
+        st.error(f"Error during urine color extraction: {e}")
+        return None, None
+
+def classify_urine_jaundice_knn(rgb_values, knn_model):
+    """
+    Classify urine jaundice using KNN model
+    
+    Args:
+        rgb_values: tuple (R, G, B)
+        knn_model: loaded KNN model for urine
+    
+    Returns:
+        dict with prediction results or None
+    """
+    if rgb_values is None or knn_model is None:
+        return None
+    
+    try:
+        input_data = np.array([list(rgb_values)])
+        
+        prediction = knn_model.predict(input_data)[0]
+        probabilities = knn_model.predict_proba(input_data)[0]
+        classes = knn_model.classes_
+        
+        pred_idx = np.where(classes == prediction)[0][0]
+        confidence = probabilities[pred_idx] * 100
+        
+        # Class 2 = Jaundice, Class 0 = Normal
+        is_jaundice = (prediction == 2)
+        status = "Jaundice Terdeteksi" if is_jaundice else "Normal"
+        
+        return {
+            'prediction': int(prediction),
+            'is_jaundice': is_jaundice,
+            'status': status,
+            'confidence': confidence,
+            'probabilities': probabilities,
+            'classes': classes
+        }
+    except Exception as e:
+        st.error(f"Error during urine classification: {e}")
+        return None
 
 def initialize_session_state():
     """Initialize session state variables"""
@@ -150,7 +377,7 @@ def main():
     initialize_session_state()
     
     # Header
-    st.markdown('<p class="main-header">🔬 Sistem Deteksi Jaundice</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">🔬 Sistem Deteksi Hepatitis</p>', unsafe_allow_html=True)
     st.markdown("---")
     
     # Progress bar
@@ -165,41 +392,41 @@ def main():
     if 1 <= st.session_state.step <= 11:
         st.header(f"📋 Pertanyaan {st.session_state.step} dari 11")
         
-        question = QUESTIONS[st.session_state.step - 1]
-        st.subheader(question)
+        question_data = QUESTIONS[st.session_state.step - 1]
+        st.subheader(question_data["question"])
         
         st.write("")  # Spacing
         
-        col1, col2, col3 = st.columns([1, 1, 1])
+        options = question_data["options"]
+        scores = question_data["scores"]
         
-        with col1:
-            pass  # Empty column for spacing
-        
-        with col2:
-            col_yes, col_no = st.columns(2)
-            
-            with col_yes:
-                if st.button("✅ Ya", use_container_width=True, type="primary", key=f"yes_{st.session_state.step}"):
-                    st.session_state.answers[f'q{st.session_state.step}'] = 'Ya'
-                    st.session_state.step += 1
-                    st.rerun()
-            
-            with col_no:
-                if st.button("❌ Tidak", use_container_width=True, key=f"no_{st.session_state.step}"):
-                    st.session_state.answers[f'q{st.session_state.step}'] = 'Tidak'
-                    st.session_state.step += 1
-                    st.rerun()
-        
-        with col3:
-            pass  # Empty column for spacing
-        
+        # Display options as buttons in a centered column
+        _, center_col, _ = st.columns([1, 2, 1])
+        with center_col:
+            # Create a new inner column layout for the buttons
+            num_options = len(options)
+            if num_options > 0:
+                cols = st.columns(num_options)
+                for i, option in enumerate(options):
+                    with cols[i]:
+                        if st.button(option, width='stretch', key=f"q{st.session_state.step}_{i}"):
+                            st.session_state.answers[f'q{st.session_state.step}'] = {
+                                'answer': option,
+                                'score': scores[i]
+                            }
+                            st.session_state.step += 1
+                            st.rerun()
+
         # Show previous answers
         if st.session_state.step > 1:
+            st.markdown("---")
             with st.expander("📊 Lihat Jawaban Sebelumnya"):
                 for i in range(1, st.session_state.step):
-                    answer = st.session_state.answers.get(f'q{i}', 'N/A')
-                    icon = "✅" if answer == "Ya" else "❌"
-                    st.write(f"{icon} **Pertanyaan {i}:** {QUESTIONS[i-1]} - **{answer}**")
+                    answer_data = st.session_state.answers.get(f'q{i}')
+                    if answer_data:
+                        answer_text = answer_data['answer']
+                        question_text = QUESTIONS[i-1]['question']
+                        st.write(f"**Pertanyaan {i}:** {question_text} → **{answer_text}**")
     
     # ========================================================================
     # BAGIAN 2: UPLOAD FOTO MATA (Step 12)
@@ -228,14 +455,14 @@ def main():
             
             if uploaded_file is not None:
                 # Convert and store
-                image_array = convert_uploaded_image(uploaded_file)
+                image_array, preview_image = convert_uploaded_image(uploaded_file)
                 st.session_state.photos['eye'] = image_array
                 
                 # Preview
                 st.success("✅ Foto mata berhasil diupload!")
-                st.image(uploaded_file, caption="Preview Foto Mata", width='content')
+                st.image(preview_image, caption="Preview Foto Mata", width='stretch')
                 
-                if st.button("➡️ Lanjut ke Upload Foto Urine", type="primary", use_container_width=True):
+                if st.button("➡️ Lanjut ke Upload Foto Urine", type="primary", width='stretch'):
                     st.session_state.step = 13
                     st.rerun()
         
@@ -271,20 +498,20 @@ def main():
             
             if uploaded_file is not None:
                 # Convert and store
-                image_array = convert_uploaded_image(uploaded_file)
+                image_array, preview_image = convert_uploaded_image(uploaded_file)
                 st.session_state.photos['urine'] = image_array
                 
                 # Preview
                 st.success("✅ Foto urine berhasil diupload!")
-                st.image(uploaded_file, caption="Preview Foto Urine", width="content")
+                st.image(preview_image, caption="Preview Foto Urine", width='stretch')
                 
-                if st.button("🔬 Analisis Sekarang", type="primary", use_container_width=True):
+                if st.button("🔬 Analisis Sekarang", type="primary", width='stretch'):
                     st.session_state.step = 14
                     st.rerun()
         
         with col2:
             st.write("**Contoh Foto yang Baik:**")
-            st.image("https://via.placeholder.com/300x400.png?text=Contoh+Foto+Urine", 
+            st.image("https://github.com/wilsonhutapea/hepacheck-ai/blob/main/assets/images/Urine%20Normal.jpg?raw=true", 
                     caption="Urine dalam gelas bening", width=300)
     
     # ========================================================================
@@ -293,56 +520,82 @@ def main():
     elif st.session_state.step == 14:
         st.header("🔬 Hasil Analisis")
         
+        # Load KNN models
+        knn_model = load_knn_model()
+        knn_urine_model = load_knn_urine_model()
+        
         eye_image = st.session_state.photos.get('eye')
         urine_image = st.session_state.photos.get('urine')
         
+        knn_result = None
+        urine_result = None
+
         col1, col2 = st.columns(2)
         
         # ====================================================================
-        # ANALISIS MATA
+        # ANALISIS MATA MENGGUNAKAN KNN MODEL
         # ====================================================================
         with col1:
-            st.subheader("👁️ Analisis Mata")
+            st.subheader("👁️ Analisis Mata (KNN Model)")
             
             if eye_image is not None:
-                with st.spinner("🔍 Menganalisis mata..."):
+                with st.spinner("🔍 Step 1: Mendeteksi mata..."):
+                    # Step 1: Eye Detection using eye_detection_module_v3
                     eye_result = multi_stage_detection(eye_image)
                 
                 if eye_result and eye_result.get('left_eye') is not None:
                     # Display detected eye
                     st.image(cv2.cvtColor(eye_result['left_eye'], cv2.COLOR_BGR2RGB), 
-                            caption="Detected Eye Region", width="content")
+                            caption="✅ Mata Terdeteksi", width='stretch')
                     
-                    # Analyze sclera color
-                    eye_color = analyze_sclera_color(
-                        eye_result['left_eye'], 
-                        eye_result['left_mask']
-                    )
+                    with st.spinner("🔍 Step 2: Mengekstrak warna RGB sclera..."):
+                        # Step 2: Extract RGB from sclera
+                        rgb_values = extract_sclera_rgb_from_detection(
+                            eye_result['left_eye'],
+                            eye_result['left_mask']
+                        )
                     
-                    if eye_color:
-                        eye_jaundice, eye_conf, eye_yi = detect_jaundice(eye_color)
+                    if rgb_values and knn_model:
+                        r, g, b = rgb_values
                         
-                        # Display metrics
-                        st.metric("Status Sclera", "⚠️ Kekuningan" if eye_jaundice else "✅ Normal")
-                        st.metric("Confidence", f"{eye_conf:.1f}%")
-                        st.metric("Yellow Index", f"{eye_yi:.3f}")
+                        with st.spinner("🤖 Step 3: Klasifikasi dengan KNN Model..."):
+                            # Step 3: Classify with KNN Model
+                            knn_result = classify_jaundice_knn(rgb_values, knn_model)
                         
-                        # Display masked sclera
-                        if eye_result.get('left_mask') is not None:
-                            eye_masked = eye_result['left_eye'].copy()
-                            eye_masked[eye_result['left_mask'] == 0] = 0
-                            with st.expander("👁️ Lihat Area Sclera"):
-                                st.image(cv2.cvtColor(eye_masked, cv2.COLOR_BGR2RGB), 
-                                       caption="Sclera (Bagian Putih Mata)", width="content")
-                        
-                        # Color details
-                        with st.expander("🎨 Detail Warna Sclera"):
-                            r, g, b = eye_color['rgb']
-                            st.write(f"**RGB:** R={r:.1f}, G={g:.1f}, B={b:.1f}")
-                            h, s, v = eye_color['hsv']
-                            st.write(f"**HSV:** H={h:.1f}°, S={s:.1f}, V={v:.1f}")
+                        if knn_result:
+                            # Display KNN prediction results
+                            eye_jaundice = knn_result['is_jaundice']
+                            eye_conf = knn_result['confidence']
+                            
+                            status_icon = "⚠️" if eye_jaundice else "✅"
+                            st.metric("Status KNN", f"{status_icon} {knn_result['status']}")
+                            st.metric("Confidence", f"{eye_conf:.1f}%")
+                            st.metric("Prediksi Kelas", f"Class {knn_result['prediction']}")
+                            
+                            # Display masked sclera
+                            if eye_result.get('left_mask') is not None:
+                                eye_masked = eye_result['left_eye'].copy()
+                                eye_masked[eye_result['left_mask'] == 0] = 0
+                                with st.expander("👁️ Lihat Area Sclera"):
+                                    st.image(cv2.cvtColor(eye_masked, cv2.COLOR_BGR2RGB), 
+                                           caption="Sclera (Bagian Putih Mata)", width='stretch')
+                            
+                            # RGB details
+                            with st.expander("🎨 Detail Warna Sclera (Input KNN)"):
+                                st.write(f"**RGB (Median):** R={r}, G={g}, B={b}")
+                                st.write(f"**Model:** K-Nearest Neighbors (k=3)")
+                                st.write(f"**Classes:** {knn_result['classes']}")
+                                
+                                # Show probabilities
+                                st.write("**Probabilitas:**")
+                                for cls, prob in zip(knn_result['classes'], knn_result['probabilities']):
+                                    cls_name = "Normal" if cls == 0 else "Jaundice"
+                                    st.write(f"  - Class {cls} ({cls_name}): {prob*100:.1f}%")
+                        else:
+                            st.error("❌ Gagal melakukan klasifikasi KNN")
+                            eye_jaundice, eye_conf = False, 0
                     else:
-                        st.warning("⚠️ Tidak dapat menganalisis warna sclera")
+                        st.warning("⚠️ Tidak dapat mengekstrak RGB sclera atau model tidak tersedia")
                         eye_jaundice, eye_conf = False, 0
                 else:
                     st.error("❌ Mata tidak terdeteksi pada foto")
@@ -358,36 +611,48 @@ def main():
             st.subheader("🧪 Analisis Urine")
             
             if urine_image is not None:
-                with st.spinner("🔍 Menganalisis urine..."):
-                    urine_analysis = analyze_urine_color(urine_image)
-                
-                # Display urine image
-                st.image(cv2.cvtColor(urine_image, cv2.COLOR_BGR2RGB), 
-                        caption="Foto Urine", width="content")
-                
-                # Display metrics
-                urine_status = "⚠️ Gelap/Abnormal" if urine_analysis['is_abnormal'] else "✅ Normal"
-                st.metric("Status Warna", urine_status)
-                st.metric("Confidence", f"{urine_analysis['confidence']:.1f}%")
-                st.metric("Brightness", f"{urine_analysis['brightness']:.1f}")
-                
-                # Color details
-                with st.expander("🎨 Detail Warna Urine"):
-                    r, g, b = urine_analysis['rgb']
-                    st.write(f"**RGB:** R={r:.1f}, G={g:.1f}, B={b:.1f}")
-                    h, s, v = urine_analysis['hsv']
-                    st.write(f"**HSV:** H={h:.1f}°, S={s:.1f}, V={v:.1f}")
-                    st.write(f"**Brightness (V):** {v:.1f}")
+                with st.spinner("🔍 Menganalisis urine dengan KNN..."):
+                    # Step 1: Extract RGB and mask
+                    urine_rgb, urine_mask = extract_urine_rgb(urine_image)
                     
-                    # Interpretation
-                    st.write("---")
-                    if urine_analysis['is_abnormal']:
-                        st.warning("Urine tampak gelap, dapat mengindikasikan tingginya kadar bilirubin")
-                    else:
-                        st.success("Warna urine dalam kisaran normal")
+                    # Step 2: Classify with KNN
+                    urine_result = classify_urine_jaundice_knn(urine_rgb, knn_urine_model)
+
+                st.image(cv2.cvtColor(urine_image, cv2.COLOR_BGR2RGB), 
+                        caption="Foto Urine", width='stretch')
                 
-                urine_jaundice = urine_analysis['is_abnormal']
-                urine_conf = urine_analysis['confidence']
+                if urine_result:
+                    urine_jaundice = urine_result['is_jaundice']
+                    print(f"urine jaundice = {urine_jaundice}") # TODO HAPUS
+                    urine_conf = urine_result['confidence']
+                    
+                    status_icon = "⚠️" if urine_jaundice else "✅"
+                    st.metric("Status KNN", f"{status_icon} {urine_result['status']}")
+                    st.metric("Confidence", f"{urine_conf:.1f}%")
+                    st.metric("Prediksi Kelas", f"Class {urine_result['prediction']}")
+
+                    # Add expander for masked urine
+                    if urine_mask is not None:
+                        urine_masked = urine_image.copy()
+                        urine_masked[urine_mask == 0] = 0
+                        with st.expander("🔬 Lihat Area Urine Terdeteksi"):
+                            st.image(cv2.cvtColor(urine_masked, cv2.COLOR_BGR2RGB), 
+                                   caption="Area Urine yang Dianalisis", width='stretch')
+
+                    with st.expander("🎨 Detail Warna Urine (Input KNN)"):
+                        r, g, b = urine_rgb
+                        st.write(f"**RGB (Median):** R={r}, G={g}, B={b}")
+                        st.write(f"**Model:** K-Nearest Neighbors")
+                        st.write(f"**Classes:** {urine_result['classes']}")
+                        
+                        st.write("**Probabilitas:**")
+                        for cls, prob in zip(urine_result['classes'], urine_result['probabilities']):
+                            cls_name = "Normal" if cls == 0 else "Jaundice"
+                            st.write(f"  - Class {cls} ({cls_name}): {prob*100:.1f}%")
+                
+                else:
+                    st.error("❌ Gagal melakukan klasifikasi urine")
+                    urine_jaundice, urine_conf = False, 0
             else:
                 st.error("❌ Foto urine tidak ditemukan")
                 urine_jaundice, urine_conf = False, 0
@@ -399,25 +664,28 @@ def main():
         st.header("📋 Kesimpulan Analisis")
         
         # Calculate symptom score
-        symptom_score = sum(1 for v in st.session_state.answers.values() if v == 'Ya')
+        symptom_score = sum(v['score'] for v in st.session_state.answers.values())
         
+        # Calculate jaundice class score from models
+        jaundice_class_score = 0
+        if knn_result and knn_result.get('prediction') == 2:
+            jaundice_class_score += 3
+        if urine_result and urine_result.get('prediction') == 2:
+            jaundice_class_score += 3
+
         # Combined detection
         visual_detection = eye_jaundice or urine_jaundice
         avg_confidence = (eye_conf + urine_conf) / 2
         
-        # Calculate total risk score
-        risk_score = 0
-        
-        # Weight from symptoms (max 40 points)
-        risk_score += (symptom_score / 11) * 40
-        
-        # Weight from eye (max 30 points)
-        if eye_jaundice:
-            risk_score += (eye_conf / 100) * 30
-        
-        # Weight from urine (max 30 points)
-        if urine_jaundice:
-            risk_score += (urine_conf / 100) * 30
+        # Calculate total risk score based on simple points division
+        total_achieved_score = symptom_score + jaundice_class_score
+        total_possible_score = MAX_SYMPTOM_SCORE + 6 # 25 symptoms + 6 from models
+            
+        # Calculate final risk score as a percentage
+        if total_possible_score > 0:
+            risk_score = (total_achieved_score / total_possible_score) * 100
+        else:
+            risk_score = 0
         
         # Determine risk level
         if risk_score >= 60:
@@ -435,8 +703,8 @@ def main():
         
         # Display risk assessment
         st.markdown(f'<div class="{risk_color}">', unsafe_allow_html=True)
-        st.markdown(f"## {risk_icon} RISIKO {risk_level} JAUNDICE")
-        st.markdown(f"**Skor Risiko Total:** {risk_score:.1f}/100")
+        st.markdown(f"## {risk_icon} RISIKO {risk_level} HEPATITIS")
+        st.markdown(f"**Skor Risiko Total:** {risk_score:.0f}%")
         st.markdown("</div>", unsafe_allow_html=True)
         
         st.write("")
@@ -445,8 +713,8 @@ def main():
         col_detail1, col_detail2, col_detail3 = st.columns(3)
         
         with col_detail1:
-            st.metric("Gejala Klinis", f"{symptom_score}/11", 
-                     delta=f"{(symptom_score/11)*100:.0f}% positif" if symptom_score > 0 else "Tidak ada")
+            st.metric("Gejala Klinis & Model", f"{total_achieved_score}/{total_possible_score}", 
+                     delta=f"{risk_score:.0f}% dari total skor" if total_achieved_score > 0 else "Tidak ada gejala")
         
         with col_detail2:
             eye_status = "⚠️ Abnormal" if eye_jaundice else "✅ Normal"
@@ -490,7 +758,7 @@ def main():
             st.success("""
             **✅ RISIKO RENDAH - TETAP JAGA KESEHATAN:**
             
-            1. Tidak ada indikasi jaundice yang signifikan
+            1. Tidak ada indikasi Hepatitis yang signifikan
             2. Tetap monitor kesehatan secara berkala
             3. Jaga pola hidup sehat:
                - Diet seimbang
@@ -503,9 +771,17 @@ def main():
         # Detail gejala
         st.markdown("---")
         with st.expander("📊 Lihat Detail Semua Gejala"):
-            for i, (key, value) in enumerate(st.session_state.answers.items(), 1):
-                icon = "✅" if value == "Ya" else "❌"
-                st.write(f"{icon} **{QUESTIONS[i-1]}** → {value}")
+            for i in range(len(QUESTIONS)):
+                question_index = i + 1
+                answer_data = st.session_state.answers.get(f'q{question_index}')
+                question_text = QUESTIONS[i]['question']
+
+                if answer_data:
+                    answer_text = answer_data['answer']
+                    score = answer_data['score']
+                    st.write(f"**{question_text}** → {answer_text} *(Skor: {score})*")
+                else:
+                    st.write(f"**{question_text}** → (Belum dijawab)")
         
         # Disclaimer
         st.markdown("---")
@@ -516,7 +792,7 @@ def main():
         pemeriksaan oleh tenaga medis profesional.
         
         Aplikasi ini hanya sebagai **alat bantu skrining awal** untuk membantu deteksi dini 
-        potensi jaundice. Untuk diagnosis yang akurat dan penanganan yang tepat, 
+        potensi Hepatitis. Untuk diagnosis yang akurat dan penanganan yang tepat, 
         **WAJIB konsultasi dengan dokter** dan melakukan pemeriksaan laboratorium lengkap.
         
         Jangan menggunakan hasil ini sebagai dasar pengobatan mandiri.
@@ -528,17 +804,17 @@ def main():
         col_btn1, col_btn2, col_btn3 = st.columns(3)
         
         with col_btn1:
-            if st.button("🔄 Analisis Baru", use_container_width=True, type="primary"):
+            if st.button("🔄 Analisis Baru", width='stretch', type="primary"):
                 for key in list(st.session_state.keys()):
                     del st.session_state[key]
                 st.rerun()
         
         with col_btn2:
-            if st.button("📄 Export Hasil (Coming Soon)", use_container_width=True, disabled=True):
+            if st.button("📄 Export Hasil (Coming Soon)", width='stretch', disabled=True):
                 st.info("Fitur export akan segera hadir!")
         
         with col_btn3:
-            if st.button("ℹ️ Info Lengkap", use_container_width=True):
+            if st.button("ℹ️ Info Lengkap", width='stretch'):
                 st.session_state.show_info = True
     
     # ========================================================================
@@ -550,19 +826,14 @@ def main():
         st.markdown("""
         ### 🔬 Tentang Sistem
         
-        Aplikasi deteksi jaundice menggunakan:
+        Aplikasi deteksi Hepatitis menggunakan:
         
         1. **11 Pertanyaan Gejala Klinis**
-        2. **Analisis Foto Mata** (warna sclera)
+        2. **Analisis Foto Mata dengan KNN Model**
+           - Deteksi mata (MediaPipe/Haar Cascade)
+           - Ekstraksi RGB sclera
+           - Klasifikasi K-Nearest Neighbors (k=3)
         3. **Analisis Foto Urine** (warna & brightness)
-        
-        ---
-        
-        ### 🎯 Metode Deteksi Mata
-        
-        - **MediaPipe Face Mesh** (full face)
-        - **Haar Cascade** (zoomed face)
-        - **Color Segmentation** (close-up)
         
         ---
         
@@ -594,7 +865,7 @@ def main():
         
         ---
         
-        ### ⚕️ Gejala Jaundice
+        ### ⚕️ Gejala Hepatitis
         
         **Utama:**
         - Kulit & mata kuning
@@ -611,8 +882,8 @@ def main():
         ---
         """)
         
-        st.caption("© 2024 Jaundice Detection System v2.0")
-        st.caption("Developed with ❤️ using Streamlit")
+        st.caption("© 2025 Hepacheck.ai")
+        st.caption("Developed by Fadey Ezra & Diandra Almeira")
         
         # Progress indicator
         if st.session_state.step < 14:
