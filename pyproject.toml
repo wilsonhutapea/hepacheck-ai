@@ -1,0 +1,4 @@
+[project]
+name = "hepacheck-ai"
+requires-python = ">=3.11,<3.13"
+
